@@ -1,0 +1,2450 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Void Dash — Anomalia</title>
+<style>
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#08081a;touch-action:none;-webkit-touch-callout:none;-webkit-user-select:none;user-select:none}
+canvas{display:block;width:100%;height:100%;background:#08081a}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+// ============================================================
+// Void Dash — Anomalia   (single-file build, no deps)
+// ============================================================
+
+// ============================================================
+// CONSTANTS
+// ============================================================
+const GRAVITY = 1800;
+const JUMP_VEL = -680;
+const BASE_SCROLL = 280;
+const PLAYER_X_FRAC = 0.18;
+const PLAYER_W = 28;
+const PLAYER_H = 40;
+const GROUND_FRAC = 0.82;
+const FIXED_DT = 1000 / 60;
+const PROGRESSION_INTERVAL = 30;
+const BOSS_SCORE = 3000;
+const BOSS_TIME = 150;
+const BOSS_WARN_DUR = 3;
+const BOSS_HP = 7;
+const MATTER_CHARGE_L2 = 0.5;
+const MATTER_CHARGE_L3 = 0.8;
+const ATTACK_DUR = 0.15;
+const BASE_ATTACK_RANGE = 70;
+const BASE_ATTACK_H = 36;
+const FISSURE_MIN_W = 70;
+const FISSURE_MAX_W = 130;
+const MINE_SIZE = 30;
+const DRONE_W = 32;
+const DRONE_H = 30;
+const SPHERE_SIZE = 24;
+const PROJ_SPEED = 500;
+const PROJ_SIZE = 14;
+const PARTICLE_LIFE = 0.5;
+const REWIND_SAFE_Y_OFFSET = 100;
+const DEFLECT_CD = 0.8;
+const DEFLECT_DUR = 0.5;
+const DEFLECT_STARTUP = 0.2;
+const DEFLECT_AURA = 16;
+const DRONE_PROJ_SPEED = 500;
+const LASER_ENEMY_SIZE = 36;
+
+// ============================================================
+// STATE
+// ============================================================
+let S = null;      // mutable state object
+
+function freshState() {
+  return {
+    phase:'start', score:0, survivalScore:0, killScore:0, elapsed:0,
+    paused:false, gameOver:false, victory:false, started:false,
+    scrollSpeed:BASE_SCROLL, scrollMul:1, difficultyMul:1,
+    lastSpeedTime:0,
+    player:{
+      x:0, y:0, vy:0, w:PLAYER_W, h:PLAYER_H,
+      onGround:false, jumpCount:0, maxJumps:1,
+      attTimer:0, attActive:false, attRange:BASE_ATTACK_RANGE,
+      attPierce:0, attTrail:0, attProjectile:false, attProjLvl:0,
+      attCone:false, bootDmg:false, hasRewind:true, attCooldown:0,
+      charging:false, chargeTimer:0, laserUseCount:0, echoCooldown:0,
+      deflectCooldown:0, deflectTimer:0, deflectActive:false, deflectReady:false,
+      invincibleTimer:0,
+      shieldHP:0, shieldCD:0,
+      isSlamming:false,
+    },
+    fissures:[], mines:[], drones:[],
+    projectiles:[], bossSpheres:[], laserEnemies:[],
+    slamRifts:[],
+    particles:[], stars:[],
+    cracks:[],
+    groundOffset:0,
+    groundSegs:[],   // {x, w, gap}
+    spawnTimer:0, spawnInterval:2,
+    progTimer:0,
+    abilityLevel:0,
+    abilityModal:{active:false,choices:[]},
+    abilities:{
+      voidVeil:{level:0,max:3,rarity:'common',name:'Véu do Vazio'},
+      gravitationalBoots:{level:0,max:3,rarity:'common',name:'Botas Gravitacionais'},
+      matterEcho:{level:0,max:3,rarity:'rare',name:'Eco de Matéria'},
+      timeDistortion:{level:0,max:3,rarity:'epic',name:'Distorção de Tempo'},
+    },
+    abilityPool:['voidVeil','gravitationalBoots','matterEcho','timeDistortion'],
+    bossTriggered:false, bossDefeated:false,
+    boss:{active:false,x:0,y:0,w:0,h:0,hp:BOSS_HP,patternTimer:0,laserWarning:0,laserY:0,laserActive:false,laserHasHit:false,laserType:0,laserPhase:'',laserTimer:0,laserTargetY:0,sphereTimer:0,bgTimer:0,bgPattern:0,moveTimer:5,movePhase:'idle',moveAlpha:1,moveFadeTimer:0,targetX:0,targetY:0},
+    bossWarningTimer:0,
+    canvas:null,ctx:null,w:0,h:0,scale:1,
+    input:{jump:false,attack:false,deflect:false,jumpJust:false,attJust:false,deflectJust:false},
+    lastTime:0,accumulator:0,lastAbilityScore:-1,
+    restartTap:false,
+    playerLaser:{active:false, y:0, life:0},
+  };
+}
+
+function resetState() {
+  const old = S;
+  S = freshState();
+  S.canvas = old.canvas;
+  S.ctx = old.ctx;
+  S.w = old.w;
+  S.h = old.h;
+  S.scale = old.scale;
+  S.stars = old.stars;
+  initStars();
+  resizePlayer();
+}
+
+// ============================================================
+// CANVAS SETUP
+// ============================================================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+S = freshState();
+S.canvas = canvas;
+S.ctx = ctx;
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  S.w = window.innerWidth;
+  S.h = window.innerHeight;
+  canvas.width = S.w * dpr;
+  canvas.height = S.h * dpr;
+  canvas.style.width = S.w + 'px';
+  canvas.style.height = S.h + 'px';
+  S.scale = dpr;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  resizePlayer();
+}
+
+function resizePlayer() {
+  S.player.x = S.w * PLAYER_X_FRAC;
+  S.player.y = groundY() - S.player.h;
+}
+
+function groundY() { return S.h * GROUND_FRAC; }
+
+window.addEventListener('resize', resize);
+resize();
+
+// ============================================================
+// STARS (background)
+// ============================================================
+function initStars() {
+  S.stars = [];
+  for (let i = 0; i < 120; i++) {
+    S.stars.push({
+      x: Math.random() * S.w,
+      y: Math.random() * groundY(),
+      r: 0.5 + Math.random() * 1.5,
+      b: 0.3 + Math.random() * 0.7,
+      sp: 0.2 + Math.random() * 0.5,
+    });
+  }
+}
+
+// ============================================================
+// INPUT
+// ============================================================
+const keys = {};
+document.addEventListener('keydown', e => {
+  if (e.repeat) return;
+  const k = e.key;
+  keys[k] = true;
+  if (k === ' ' || k === 'w' || k === 'W' || k === 'ArrowUp') { S.input.jump = true; S.input.jumpJust = true; e.preventDefault(); }
+  if (k === 'z' || k === 'Z' || k === 'j' || k === 'J') { S.input.attack = true; S.input.attJust = true; e.preventDefault(); }
+  if (k === 'x' || k === 'X') { S.input.deflect = true; S.input.deflectJust = true; e.preventDefault(); }
+  if (S.phase === 'start' && (k === ' ' || k === 'Enter')) { startGame(); e.preventDefault(); }
+  if ((S.gameOver || S.victory) && (k === ' ' || k === 'Enter')) { resetState(); e.preventDefault(); }
+});
+document.addEventListener('keyup', e => {
+  const k = e.key;
+  keys[k] = false;
+  if (k === ' ' || k === 'w' || k === 'W' || k === 'ArrowUp') S.input.jump = false;
+  if (k === 'z' || k === 'Z' || k === 'j' || k === 'J') S.input.attack = false;
+  if (k === 'x' || k === 'X') S.input.deflect = false;
+});
+
+// Touch / mouse
+let touchAttackId = null;
+canvas.addEventListener('touchstart', e => { e.preventDefault(); const t = e.changedTouches[0]; const [cx, cy] = clientToCanvas(t.clientX, t.clientY); const zone = handleTap(cx, cy); if (zone === 'attack') touchAttackId = t.identifier; });
+canvas.addEventListener('mousedown', e => { const [cx, cy] = clientToCanvas(e.clientX, e.clientY); handleTap(cx, cy); });
+
+function clientToCanvas(cx, cy) {
+  const rect = canvas.getBoundingClientRect();
+  return [(cx - rect.left) * (S.w / rect.width), (cy - rect.top) * (S.h / rect.height)];
+}
+
+function handleTap(cx, cy) {
+  if (S.phase === 'start') { startGame(); return null; }
+  if (S.gameOver || S.victory) { resetState(); return null; }
+  if (S.abilityModal.active) {
+    const choice = hitTestModal(cx, cy);
+    if (choice !== -1) { selectAbility(choice); }
+    return null;
+  }
+  // In-game: left=jump, center=attack, right=deflect
+  const third = S.w / 3;
+  if (cx < third) { S.input.jump = true; S.input.jumpJust = true; return 'jump'; }
+  else if (cx < third * 2) { S.input.attack = true; S.input.attJust = true; return 'attack'; }
+  else { S.input.deflect = true; S.input.deflectJust = true; return 'deflect'; }
+}
+
+canvas.addEventListener('touchend', e => { e.preventDefault(); for (const t of e.changedTouches) { if (t.identifier === touchAttackId) { S.input.attack = false; touchAttackId = null; } } });
+canvas.addEventListener('touchcancel', e => { e.preventDefault(); S.input.attack = false; touchAttackId = null; });
+
+// ============================================================
+// HELPERS
+// ============================================================
+function lerp(a, b, t) { return a + (b - a) * t; }
+function rand(a, b) { return a + Math.random() * (b - a); }
+function randInt(a, b) { return Math.floor(rand(a, b + 1)); }
+function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+function aabb(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+function effRarity(id) {
+  const a = S.abilities[id];
+  if (id === 'matterEcho' && a.level === 2) return 'legendary';
+  return a.rarity;
+}
+
+// ============================================================
+// ABILITY DESCRIPTIONS
+// ============================================================
+const ABIL_DESC = {
+  voidVeil: [
+    'Escudo que absorve 1 hit. Recarga 10s.',
+    'Recarga 8s. Ao quebrar, pulo destrói projéteis num raio.',
+    'Recarga 6s. Escudo reflete o primeiro projétil inimigo.',
+  ],
+  gravitationalBoots: [
+    'Pulo duplo',
+    'Pulo triplo',
+    'Dano em trajetória ascendente',
+  ],
+  matterEcho: [
+    'Ataque vira projétil de energia',
+    'SEGURAR: carrega projétil potente que\natravessa 1 inimigo. Soltar cedo = comum',
+    'CARGA DUPLA: segurar mais carrega LASER.\nAtinge todos no caminho!\nPoder absoluto!\n(3 usos = cd 3s na hab.)',
+  ],
+  timeDistortion: [
+    'No ar, REBATER ativa uma queda rápida. Ao cair, onda de choque destrói inimigos e projéteis num raio.',
+    'Onda de choque maior. Deixa uma Fenda Dimensional por 2s que danifica quem entrar.',
+    'Retrocesso: ao receber dano letal, volta 3s (uma vez por partida)',
+  ],
+};
+
+// ============================================================
+// GAME START
+// ============================================================
+function startGame() {
+  S.phase = 'playing';
+  S.started = true;
+  S.player.x = S.w * PLAYER_X_FRAC;
+  S.player.y = groundY() - S.player.h;
+  initStars();
+  S.spawnInterval = 2;
+  S.progTimer = 0;
+}
+
+// ============================================================
+// UPDATE — called every fixed dt
+// ============================================================
+function update(dt) {
+  if (S.phase !== 'playing' && S.phase !== 'boss') return;
+  if (S.paused || S.gameOver || S.victory) return;
+
+  const isBoss = S.phase === 'boss';
+
+  // elapsed & survival score (rate 7/s = 2× longer to reach milestones)
+  S.elapsed += dt;
+  S.survivalScore += dt * 10;
+  S.score = Math.floor(S.survivalScore + S.killScore);
+
+  // scroll speed (gradually increases)
+  if (!isBoss) {
+    S.scrollSpeed = BASE_SCROLL + S.elapsed * 1.5;
+  }
+  // difficulty scaling: +10% per 30s
+  const timeStep = Math.floor(S.elapsed / 30);
+  if (timeStep > S.lastSpeedTime) { S.difficultyMul *= 1.1; S.lastSpeedTime = timeStep; }
+
+  const spd = S.scrollSpeed * S.scrollMul * S.difficultyMul;
+
+  // ground scroll
+  if (!isBoss) S.groundOffset = (S.groundOffset + spd * dt) % 60;
+
+  // --- player ---
+  updatePlayer(dt, spd);
+
+  // --- spawn (only if not boss phase) ---
+  if (!isBoss) updateSpawning(dt, spd);
+
+  // --- move entities ---
+  moveEntities(dt, spd);
+
+  // --- collision ---
+  if (!isBoss) {
+    checkCollisions();
+  } else {
+    checkBossCollisions();
+  }
+
+  // --- boss logic ---
+  if (isBoss) updateBoss(dt);
+
+  // --- projectiles ---
+  updateProjectiles(dt);
+
+  // --- particles ---
+  updateParticles(dt);
+
+  // --- player laser ---
+  if (S.playerLaser.active) {
+    S.playerLaser.life -= dt;
+    if (S.playerLaser.life <= 0) S.playerLaser.active = false;
+  }
+
+  // --- slam rifts ---
+  for (const r of S.slamRifts) {
+    if (!r.active) continue;
+    r.timer -= dt;
+    if (r.timer <= 0) { r.active = false; continue; }
+    // destroy enemies that touch the rift
+    for (const d of S.drones) {
+      if (!d.active) continue;
+      if (aabb(r, d)) destroyDrone(d);
+    }
+    for (const proj of S.projectiles) {
+      if (!proj.active || !proj.fromEnemy) continue;
+      if (aabb(r, proj)) proj.active = false;
+    }
+  }
+
+  // --- cracks ---
+  for (const c of S.cracks) {
+    c.life -= dt;
+  }
+  S.cracks = S.cracks.filter(c => c.life > 0);
+
+  // --- progression timer (every 30s) ---
+  if (!isBoss && !S.abilityModal.active && !S.bossTriggered) {
+    S.progTimer += dt;
+    if (S.progTimer >= PROGRESSION_INTERVAL) {
+      S.progTimer = 0;
+      triggerAbilityModal();
+    }
+    // score-based ability (every 700 points)
+    const abilityScoreStep = Math.floor(S.score / 600);
+    if (abilityScoreStep > S.lastAbilityScore) {
+      S.lastAbilityScore = abilityScoreStep;
+      triggerAbilityModal();
+    }
+  }
+
+  // --- boss trigger ---
+  if (!S.bossTriggered && !isBoss && (S.score >= BOSS_SCORE || S.elapsed >= BOSS_TIME)) {
+    triggerBoss();
+  }
+
+  // --- cleanup offscreen entities ---
+  cleanupEntities();
+}
+
+// ============================================================
+// PLAYER UPDATE
+// ============================================================
+function updatePlayer(dt, spd) {
+  const p = S.player;
+
+  // invincibility countdown
+  if (p.invincibleTimer > 0) p.invincibleTimer -= dt;
+
+  // clear stale input flags when keys released
+  if (!S.input.jump) S.input.jumpJust = false;
+  if (!S.input.attack) S.input.attJust = false;
+
+  // gravity
+  if (!p.onGround) {
+    p.vy += GRAVITY * dt;
+  }
+
+  // jump
+  if (S.input.jumpJust) {
+    if (p.onGround || p.jumpCount < p.maxJumps) {
+      p.vy = JUMP_VEL;
+      p.onGround = false;
+      p.jumpCount++;
+      S.input.jumpJust = false;
+      spawnParticles(p.x + p.w/2, p.y + p.h, 5, '#00f0ff', 3);
+    }
+  }
+
+  // apply velocity
+  p.y += p.vy * dt;
+
+  // ground collision
+  const gy = groundY();
+  const overFissure = isOverFissure();
+  if (p.y + p.h >= gy) {
+    if (overFissure) {
+      // fall through gap
+      p.onGround = false;
+    } else {
+      p.y = gy - p.h;
+      p.vy = 0;
+      if (!p.onGround) {
+        if (p.isSlamming) {
+          executeSlamImpact(p);
+          p.isSlamming = false;
+        }
+        spawnParticles(p.x + p.w/2, gy, 4, '#00f0ff', 2);
+      }
+      p.onGround = true;
+      p.jumpCount = 0;
+    }
+  } else {
+    p.onGround = false;
+  }
+
+  // fall off screen = game over (unless rewind or shield available)
+  if (p.y + p.h > S.h + 20) {
+    if (p.hasRewind && S.abilities.timeDistortion.level === 3) {
+      triggerRewind();
+    } else if (consumeShield()) {
+      p.y = groundY() - p.h;
+      p.vy = 0;
+      p.onGround = true;
+    } else {
+      gameOver();
+    }
+    return;
+  }
+
+  // gravity boots L3: damage enemies on upward trajectory
+  p.bootDmg = false;
+  if (S.abilities.gravitationalBoots.level === 3 && p.vy < 0 && !p.onGround) {
+    p.bootDmg = true;
+  }
+
+  // void veil shield recharge
+  if (p.shieldHP === 0 && p.shieldCD > 0 && S.abilities.voidVeil.level > 0) {
+    p.shieldCD -= dt;
+    if (p.shieldCD <= 0) p.shieldHP = 1;
+  }
+
+  // attack / echo cooldowns
+  if (p.attCooldown > 0) p.attCooldown -= dt;
+  if (p.echoCooldown > 0) p.echoCooldown -= dt;
+
+  // attack / charge start
+  if (S.input.attJust && p.attCooldown <= 0 && !p.charging) {
+    const echoLvl = S.abilities.matterEcho.level;
+    if (echoLvl >= 1 && p.echoCooldown > 0) {
+      // echo on cooldown — can't attack
+    } else if (echoLvl >= 2) {
+      p.charging = true;
+      p.chargeTimer = 0;
+    } else {
+      // L0 melee or L1 projectile
+      triggerAttack();
+      p.attCooldown = 0.35;
+    }
+  }
+  S.input.attJust = false;
+
+  // charging update
+  if (p.charging) {
+    p.chargeTimer += dt;
+    const echoLvl = S.abilities.matterEcho.level;
+    if (echoLvl >= 3 && p.chargeTimer >= MATTER_CHARGE_L3) {
+      firePlayerLaser();
+      p.charging = false;
+      p.attCooldown = 0.35;
+    } else if (echoLvl === 2 && p.chargeTimer >= MATTER_CHARGE_L2) {
+      fireProjCharged();
+      p.charging = false;
+      p.attCooldown = 0.35;
+    } else if (!S.input.attack) {
+      // released early
+      if (p.chargeTimer >= MATTER_CHARGE_L2) {
+        fireProjCharged();
+      } else {
+        fireProjBasic();
+      }
+      p.charging = false;
+      p.attCooldown = 0.35;
+    }
+  }
+
+  // L1 legacy attActive (projectile fires after timer)
+  if (p.attActive) {
+    p.attTimer -= dt;
+    if (p.attTimer <= 0) {
+      p.attActive = false;
+      if (p.attProjectile) {
+        fireProjectile();
+      }
+    }
+  }
+
+  // deflect (rebater) / Ground Slam (Time Distortion L1+ no ar)
+  if (p.deflectCooldown > 0) p.deflectCooldown -= dt;
+  if (S.input.deflectJust && p.deflectCooldown <= 0 && !p.deflectActive) {
+    const tdLvl = S.abilities.timeDistortion.level;
+    if (tdLvl >= 1 && !p.onGround) {
+      // Ground Slam
+      p.vy = 800;
+      p.isSlamming = true;
+      p.deflectActive = true;
+      p.deflectTimer = DEFLECT_DUR;
+      p.deflectReady = true;
+      p.deflectCooldown = DEFLECT_CD;
+      spawnParticles(p.x + p.w/2, p.y + p.h/2, 6, '#ffaa00', 5);
+    } else {
+      p.deflectActive = true;
+      p.deflectTimer = DEFLECT_DUR;
+      p.deflectReady = false;
+      p.deflectCooldown = DEFLECT_CD;
+      spawnParticles(p.x + p.w, p.y + p.h/2, 4, '#aa00ff', 3);
+    }
+  }
+  S.input.deflectJust = false;
+  if (p.deflectActive) {
+    p.deflectTimer -= dt;
+    if (p.deflectTimer <= DEFLECT_DUR - DEFLECT_STARTUP && !p.deflectReady) {
+      p.deflectReady = true;
+    }
+    if (p.deflectTimer <= 0) {
+      p.deflectActive = false;
+      p.deflectReady = false;
+    }
+  }
+
+  // attack trail (Expanded Fissure L3)
+  if (p.attTrail > 0) {
+    p.attTrail -= dt;
+  }
+
+  // clamp player y above 0
+  if (p.y < 0) { p.y = 0; p.vy = 0; }
+}
+
+function consumeShield() {
+  const p = S.player;
+  const lvl = S.abilities.voidVeil.level;
+  if (lvl <= 0 || p.shieldHP <= 0) return false;
+  p.shieldHP = 0;
+  p.shieldCD = lvl >= 3 ? 6 : lvl >= 2 ? 8 : 10;
+  spawnParticles(p.x + p.w/2, p.y + p.h/2, 8, '#00ffff', 5);
+  // L2: pulse destroys enemy projectiles in radius
+  if (lvl >= 2) {
+    const cx = p.x + p.w/2, cy = p.y + p.h/2, radius = 60;
+    for (const proj of S.projectiles) {
+      if (!proj.active || !proj.fromEnemy) continue;
+      const dx = proj.x - cx, dy = proj.y - cy;
+      if (dx*dx + dy*dy < radius*radius) {
+        proj.active = false;
+        spawnParticles(proj.x, proj.y, 3, '#00ffff', 2);
+      }
+    }
+  }
+  return true;
+}
+
+function executeSlamImpact(p) {
+  const lvl = S.abilities.timeDistortion.level;
+  const radius = lvl >= 2 ? 130 : 80;
+  const cx = p.x + p.w/2, cy = p.y + p.h/2;
+  // destroy drones in range
+  for (const d of S.drones) {
+    if (!d.active) continue;
+    const dx = d.x - cx, dy = d.y - cy;
+    if (dx*dx + dy*dy < radius*radius) destroyDrone(d);
+  }
+  // destroy mines in range
+  for (const m of S.mines) {
+    if (!m.active) continue;
+    const dx = m.x - cx, dy = m.y - cy;
+    if (dx*dx + dy*dy < radius*radius) m.active = false;
+  }
+  // destroy enemy projectiles in range
+  for (const proj of S.projectiles) {
+    if (!proj.active || !proj.fromEnemy) continue;
+    const dx = proj.x - cx, dy = proj.y - cy;
+    if (dx*dx + dy*dy < radius*radius) proj.active = false;
+  }
+  spawnParticles(cx, cy, 20, '#ffaa00', 6);
+  // L2: create lingering spatial rift
+  if (lvl >= 2) {
+    S.slamRifts.push({ x: cx - 30, y: cy - 30, w: 60, h: 60, timer: 2, active: true });
+  }
+  // screen cracks (Whitebeard-style)
+  for (let i = 0; i < 12; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const len = 40 + Math.random() * 60;
+    S.cracks.push({ x: cx, y: cy, angle: a, length: len, life: 0.4, maxLife: 0.4 });
+  }
+}
+
+function isOverFissure() {
+  const p = S.player;
+  for (const f of S.fissures) {
+    if (!f.active) continue;
+    if (p.x + p.w > f.x && p.x < f.x + f.w) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ============================================================
+// ATTACK
+// ============================================================
+function triggerAttack() {
+  const p = S.player;
+  p.attActive = true;
+  p.attTimer = ATTACK_DUR;
+
+  // attack range (base — no longer modified by voidVeil)
+  p.attRange = BASE_ATTACK_RANGE;
+  p.attPierce = 0;
+  p.attTrail = 0;
+
+  p.attProjectile = S.abilities.matterEcho.level >= 1;
+  p.attProjLvl = S.abilities.matterEcho.level;
+  p.attCone = S.abilities.matterEcho.level >= 3;
+
+  // visual
+  spawnParticles(p.x + p.w, p.y + p.h/2, 3, '#ffffff', 2);
+
+  // check melee hit (non-projectile)
+  if (!p.attProjectile) {
+    const attBox = { x: p.x + p.w, y: p.y + 2, w: p.attRange, h: BASE_ATTACK_H };
+    let pierced = 0;
+    for (const d of S.drones) {
+      if (!d.active) continue;
+      if (aabb(attBox, d)) {
+        destroyDrone(d);
+        pierced++;
+        if (p.attPierce > 0 && pierced >= p.attPierce) break;
+      }
+    }
+    // also destroy enemy projectiles
+    for (const proj of S.projectiles) {
+      if (!proj.active || !proj.fromEnemy) continue;
+      if (aabb(attBox, proj)) {
+        proj.active = false;
+        spawnParticles(proj.x, proj.y, 4, '#00f0ff', 3);
+      }
+    }
+  }
+}
+
+function fireProjectile() {
+  const p = S.player;
+  const lvl = p.attProjLvl;
+  const count = p.attCone ? 3 : 1;
+  const angles = p.attCone ? [-0.15, 0, 0.15] : [0];
+  const size = lvl >= 2 ? PROJ_SIZE * 1.6 : PROJ_SIZE;
+  const speed = lvl >= 2 ? PROJ_SPEED * 1.3 : PROJ_SPEED;
+
+  for (const ang of angles) {
+    const vx = Math.cos(ang) * speed;
+    const vy = Math.sin(ang) * speed;
+    S.projectiles.push({
+      x: p.x + p.w, y: p.y + p.h/2 - size/2,
+      w: size, h: size, vx, vy,
+      active: true, pierce: lvl >= 2 ? 99 : 0,
+      canDestroyMines: lvl >= 2,
+    });
+  }
+}
+
+function fireProjBasic() {
+  const p = S.player;
+  const size = PROJ_SIZE, speed = PROJ_SPEED;
+  spawnParticles(p.x + p.w, p.y + p.h/2, 3, '#ffffff', 2);
+  S.projectiles.push({
+    x: p.x + p.w, y: p.y + p.h/2 - size/2,
+    w: size, h: size, vx: speed, vy: 0,
+    active: true, pierce: 0, canDestroyMines: false,
+  });
+}
+
+function fireProjCharged() {
+  const p = S.player;
+  const size = PROJ_SIZE * 1.6, speed = PROJ_SPEED * 1.3;
+  spawnParticles(p.x + p.w, p.y + p.h/2, 6, '#00ffff', 4);
+  S.projectiles.push({
+    x: p.x + p.w, y: p.y + p.h/2 - size/2,
+    w: size, h: size, vx: speed, vy: 0,
+    active: true, pierce: 1, canDestroyMines: true,
+  });
+}
+
+function firePlayerLaser() {
+  const p = S.player;
+  // find nearest enemy on X axis (ignore mines)
+  let targetY = p.y + p.h/2;
+  let targetFound = false;
+  const candidates = [];
+  for (const d of S.drones) { if (d.active) candidates.push(d); }
+  for (const e of S.laserEnemies) { if (e.active) candidates.push(e); }
+  if (S.boss.active) candidates.push(S.boss);
+  let nearest = null, nearestX = Infinity;
+  for (const e of candidates) {
+    const ex = e.x + e.w/2;
+    if (ex > p.x + p.w && ex < nearestX) {
+      nearestX = ex;
+      nearest = e;
+    }
+  }
+  if (nearest) {
+    targetY = nearest.y + nearest.h/2;
+    targetFound = true;
+  }
+  // activate laser
+  S.playerLaser.active = true;
+  S.playerLaser.y = targetY;
+  S.playerLaser.life = 0.15;
+  // immediate damage check
+  const laserY = targetY, laserH = 8;
+  for (const d of S.drones) {
+    if (!d.active) continue;
+    if (d.y + d.h > laserY && d.y < laserY + laserH) destroyDrone(d);
+  }
+  for (const e of S.laserEnemies) {
+    if (!e.active) continue;
+    if (e.y + e.h > laserY && e.y < laserY + laserH) {
+      e.active = false;
+      S.killScore += 100;
+      spawnParticles(e.x + e.w/2, e.y + e.h/2, 8, '#ff0044', 4);
+    }
+  }
+  if (S.boss.active) {
+    const b = S.boss;
+    if (b.y + b.h > laserY && b.y < laserY + laserH) {
+      b.hp -= 1;
+      spawnParticles(b.x + b.w/2, b.y + b.h/2, 10, '#ff4400', 6);
+      if (b.hp <= 0) victory();
+    }
+  }
+  // laser use counter → cooldown after 3
+  p.laserUseCount++;
+  if (p.laserUseCount >= 3) p.echoCooldown = 3;
+  spawnParticles(p.x + p.w, p.y + p.h/2, 8, '#0088ff', 5);
+}
+
+function destroyDrone(d) {
+  d.active = false;
+  d.alive = false;
+  S.killScore += 50;
+  spawnParticles(d.x + d.w/2, d.y + d.h/2, 8, '#00ff88', 4);
+}
+
+// ============================================================
+// SPAWNING
+// ============================================================
+function updateSpawning(dt, spd) {
+  S.spawnTimer += dt;
+  if (S.spawnTimer >= S.spawnInterval) {
+    S.spawnTimer = 0;
+    // gradually increase difficulty
+    S.spawnInterval = Math.max(0.6, 2 - S.elapsed * 0.008);
+    spawnEntity();
+  }
+}
+
+function spawnEntity() {
+  const roll = Math.random();
+  const gy = groundY();
+
+  if (roll < 0.28) {
+    // fissure
+    const fw = rand(FISSURE_MIN_W, FISSURE_MAX_W);
+    S.fissures.push({
+      x: S.w + 20, y: gy, w: fw, h: S.h - gy,
+      active: true, alive: true,
+    });
+  } else if (roll < 0.42) {
+    // mine
+    const my = rand(gy * 0.65, gy * 0.85);
+    S.mines.push({
+      x: S.w + 20, y: my,
+      w: MINE_SIZE, h: MINE_SIZE,
+      active: true, alive: true,
+    });
+  } else if (roll < 0.68) {
+    // drone
+    S.drones.push({
+      x: S.w + 20, y: gy - DRONE_H,
+      w: DRONE_W, h: DRONE_H,
+      active: true, alive: true,
+      shootTimer: rand(1.5, 3.5), shootWarning: 0, vy: 0,
+    });
+  } else {
+    // laser enemy
+    S.laserEnemies.push({
+      x: S.w + 20, y: gy - LASER_ENEMY_SIZE,
+      w: LASER_ENEMY_SIZE, h: LASER_ENEMY_SIZE,
+      active: true, phase:'moving', phaseTimer:0, targetY:0, laserY:0,
+      hasHit: false,
+    });
+  }
+}
+
+// ============================================================
+// ENTITY MOVEMENT
+// ============================================================
+function moveEntities(dt, spd) {
+  const gy = groundY();
+  for (const f of S.fissures) { if (f.active) f.x -= spd * dt; }
+  for (const m of S.mines) { if (m.active) m.x -= spd * dt; }
+  for (const d of S.drones) { if (d.active) {
+    d.x -= spd * dt;
+    d.vy = (d.vy || 0) + GRAVITY * dt;
+    d.y += d.vy * dt;
+    if (d.y + d.h >= gy) { d.y = gy - d.h; d.vy = 0; }
+    // drone jumps when player is airborne nearby
+    const pl = S.player;
+    if (!pl.onGround && Math.abs(pl.x - d.x) < 200 && d.y + d.h >= gy - 1) {
+      d.vy = -400;
+    }
+  } }
+  for (const s of S.bossSpheres) { if (s.active) { s.x += s.vx * dt; s.y += s.vy * dt; } }
+  // laser enemies
+  for (const e of S.laserEnemies) { if (e.active) moveLaserEnemy(e, dt, spd, gy); }
+  // drone shooting
+  for (const d of S.drones) { if (d.active) updateDroneShoot(d, dt); }
+}
+
+function moveLaserEnemy(e, dt, spd, gy) {
+  switch (e.phase) {
+    case 'moving':
+      e.x -= spd * dt;
+      if (e.x < S.w * 0.6) { e.phase = 'charging'; e.phaseTimer = 0.8; e.targetY = S.player.y + S.player.h/2; }
+      break;
+    case 'charging':
+      e.phaseTimer -= dt;
+      e.targetY = S.player.y + S.player.h/2; // track player during charge
+      if (e.phaseTimer <= 0) { e.phase = 'warning'; e.phaseTimer = 0.3; e.laserY = e.targetY; }
+      break;
+    case 'warning':
+      e.phaseTimer -= dt;
+      if (e.phaseTimer <= 0) { e.phase = 'firing'; e.phaseTimer = 0.2; }
+      break;
+    case 'firing':
+      e.phaseTimer -= dt;
+      if (e.phaseTimer <= 0) e.active = false;
+      // collision with player (once per laser instance)
+      if (!e.hasHit && S.player.invincibleTimer <= 0 && S.player.y + S.player.h > e.laserY && S.player.y < e.laserY + 8) {
+        e.hasHit = true;
+        if (S.player.hasRewind && S.abilities.timeDistortion.level === 3) triggerRewind();
+        else if (!consumeShield()) gameOver();
+      }
+      break;
+  }
+}
+
+function updateDroneShoot(d, dt) {
+  if (d.shootWarning > 0) {
+    d.shootWarning -= dt;
+    if (d.shootWarning <= 0) {
+      // fire projectile toward player
+      const pl = S.player;
+      const angle = Math.atan2((pl.y + pl.h/2) - (d.y + d.h/2), pl.x - d.x);
+      S.projectiles.push({
+        x: d.x, y: d.y + d.h/2 - 8, w: 16, h: 16,
+        vx: Math.cos(angle) * DRONE_PROJ_SPEED,
+        vy: Math.sin(angle) * DRONE_PROJ_SPEED,
+        active: true, fromEnemy: true,
+      });
+    }
+  }
+  d.shootTimer -= dt;
+  if (d.shootTimer <= 0.3 && d.shootWarning <= 0) {
+    d.shootWarning = 0.3;
+    d.shootTimer = rand(1.5, 3.5);
+  }
+}
+
+function cleanupEntities() {
+  S.fissures = S.fissures.filter(e => e.x + e.w > -100);
+  S.mines = S.mines.filter(e => e.x + e.w > -100);
+  S.drones = S.drones.filter(e => e.x + e.w > -100);
+  S.projectiles = S.projectiles.filter(e => e.active && e.x < S.w + 100 && e.x > -100);
+  S.bossSpheres = S.bossSpheres.filter(e => e.active);
+  S.laserEnemies = S.laserEnemies.filter(e => e.active);
+  S.slamRifts = S.slamRifts.filter(e => e.active);
+}
+
+// ============================================================
+// COLLISION (non-boss)
+// ============================================================
+function checkCollisions() {
+  const p = S.player;
+  if (p.invincibleTimer > 0) return;
+
+  function shieldOrDie() {
+    if (consumeShield()) return false;
+    gameOver();
+    return true;
+  }
+
+  // Fissure collision
+  for (const f of S.fissures) {
+    if (!f.active) continue;
+    if (p.x + p.w > f.x && p.x < f.x + f.w) {
+      // player is over fissure and not in air above it
+      if (p.y + p.h >= f.y - 2 && !p.onGround) {
+        // falling into fissure - already handled by gravity
+      }
+    }
+  }
+
+  // Mine collision
+  for (const m of S.mines) {
+    if (!m.active) continue;
+    if (aabb(p, m)) {
+      if (p.hasRewind && S.abilities.timeDistortion.level === 3) {
+        triggerRewind();
+        m.active = false;
+      } else if (shieldOrDie()) { return; }
+      m.active = false;
+      break;
+    }
+  }
+
+  // Enemy projectile collision
+  for (const proj of S.projectiles) {
+    if (!proj.active || !proj.fromEnemy) continue;
+    if (aabb(p, proj)) {
+      if (p.hasRewind && S.abilities.timeDistortion.level === 3) { triggerRewind(); proj.active = false; }
+      else if (shieldOrDie()) { return; }
+      proj.active = false;
+      break;
+    }
+  }
+
+  // Drone collision
+  for (const d of S.drones) {
+    if (!d.active) continue;
+    if (aabb(p, d)) {
+      // Gravitational Boots L3: upward trajectory destroys drone
+      if (p.bootDmg && p.vy < 0) {
+        destroyDrone(d);
+        continue;
+      }
+      if (p.hasRewind && S.abilities.timeDistortion.level === 3) {
+        triggerRewind();
+        d.active = false;
+      } else if (shieldOrDie()) { return; }
+      d.active = false;
+      break;
+    }
+  }
+
+  // Deflect hitbox vs drone projectiles (and boss spheres)
+  const pDeflect = S.player;
+  if (pDeflect.deflectReady) {
+    const a = DEFLECT_AURA;
+    const defBox = { x: pDeflect.x - a, y: pDeflect.y - a, w: pDeflect.w + a*2, h: pDeflect.h + a*2 };
+    for (const proj of S.projectiles) {
+      if (!proj.active || !proj.fromEnemy) continue;
+      if (aabb(defBox, proj)) {
+        proj.fromEnemy = false;
+        proj.vx = -proj.vx;
+        proj.vy = -proj.vy;
+        proj.pierce = 0;
+        spawnParticles(proj.x, proj.y, 5, '#aa00ff', 4);
+      }
+    }
+    for (const s of S.bossSpheres) {
+      if (!s.active || s.deflected) continue;
+      
+      if (aabb(defBox, s)) {
+        s.deflected = true;
+        redirectToBoss(s);
+        spawnParticles(s.x + s.w/2, s.y + s.h/2, 6, '#ffaa00', 5);
+      }
+    }
+  }
+
+  // Projectile collision (player projectiles against enemies)
+  for (const proj of S.projectiles) {
+    if (!proj.active || proj.fromEnemy) continue;
+    for (const d of S.drones) {
+      if (!d.active) continue;
+      if (aabb(proj, d)) {
+        destroyDrone(d);
+        proj.pierce--;
+        if (proj.pierce <= 0) proj.active = false;
+      }
+    }
+    // destroy enemy projectiles with attack
+    for (const eproj of S.projectiles) {
+      if (!eproj.active || !eproj.fromEnemy) continue;
+      if (eproj === proj) continue;
+      if (aabb(proj, eproj)) {
+        eproj.active = false;
+        proj.pierce--;
+        if (proj.pierce <= 0) proj.active = false;
+      }
+    }
+    // Matter Echo L2: destroy mines and laser enemies
+    if (proj.canDestroyMines) {
+      for (const m of S.mines) {
+        if (!m.active) continue;
+        if (aabb(proj, m)) {
+          m.active = false;
+          spawnParticles(m.x + m.w/2, m.y + m.h/2, 6, '#ff0044', 3);
+          proj.pierce--;
+          if (proj.pierce <= 0) proj.active = false;
+        }
+      }
+      for (const e of S.laserEnemies) {
+        if (!e.active) continue;
+        if (aabb(proj, e)) {
+          e.active = false;
+          S.killScore += 100;
+          spawnParticles(e.x + e.w/2, e.y + e.h/2, 6, '#ff0044', 3);
+          proj.pierce--;
+          if (proj.pierce <= 0) proj.active = false;
+        }
+      }
+    }
+  }
+}
+
+// ============================================================
+// BOSS COLLISION
+// ============================================================
+function checkBossCollisions() {
+  const p = S.player;
+  if (p.invincibleTimer > 0) return;
+  const boss = S.boss;
+  if (!boss.active) return;
+
+  // player collision with boss sphere
+  for (const s of S.bossSpheres) {
+    if (!s.active) continue;
+    if (aabb(p, s)) {
+      if (p.hasRewind && S.abilities.timeDistortion.level === 3) {
+        triggerRewind();
+        p.x = S.w * PLAYER_X_FRAC;
+        s.active = false;
+      } else if (consumeShield()) {
+        s.active = false;
+      } else {
+        gameOver();
+        return;
+      }
+      return;
+    }
+  }
+
+  // boss laser collision (single hit per laser instance)
+  if (boss.laserActive && !boss.laserHasHit) {
+    const laserH = 8;
+    const canHit = boss.laserType === 0 || boss.laserPhase === 'firing';
+    if (canHit && p.y + p.h > boss.laserY && p.y < boss.laserY + laserH) {
+      boss.laserHasHit = true;
+      if (p.hasRewind && S.abilities.timeDistortion.level === 3) {
+        triggerRewind();
+      } else if (consumeShield()) {
+        // survived via shield
+      } else {
+        gameOver();
+      }
+      return;
+    }
+  }
+
+  // deflect hits boss sphere
+  if (p.deflectReady) {
+    const a = DEFLECT_AURA;
+    const defBox = { x: p.x - a, y: p.y - a, w: p.w + a*2, h: p.h + a*2 };
+    for (const s of S.bossSpheres) {
+      if (!s.active || s.deflected) continue;
+      
+      if (aabb(defBox, s)) {
+        s.deflected = true;
+        redirectToBoss(s);
+        spawnParticles(s.x + s.w/2, s.y + s.h/2, 6, '#ffaa00', 5);
+      }
+    }
+  }
+
+  // attack hits boss sphere (deflection)
+  if (p.attActive) {
+    const attBox = { x: p.x + p.w, y: p.y + 2, w: p.attRange, h: BASE_ATTACK_H };
+    for (const s of S.bossSpheres) {
+      if (!s.active || s.deflected) continue;
+      
+      if (aabb(attBox, s)) {
+        s.deflected = true;
+        redirectToBoss(s);
+        spawnParticles(s.x + s.w/2, s.y + s.h/2, 6, '#ffaa00', 5);
+      }
+    }
+  }
+
+  // projectile deflection
+  for (const proj of S.projectiles) {
+    if (!proj.active) continue;
+    for (const s of S.bossSpheres) {
+      if (!s.active || s.deflected) continue;
+      
+      if (aabb(proj, s)) {
+        s.deflected = true;
+        redirectToBoss(s);
+        spawnParticles(s.x, s.y, 6, '#ffaa00', 5);
+        proj.active = false;
+      }
+    }
+  }
+
+  // deflected sphere hits boss
+  for (const s of S.bossSpheres) {
+    if (!s.active || !s.deflected) continue;
+    const b = boss;
+    if (s.x < b.x + b.w && s.x + s.w > b.x && s.y < b.y + b.h && s.y + s.h > b.y) {
+      // hit boss!
+      b.hp--;
+      spawnParticles(s.x, s.y, 10, '#ff4400', 6);
+      s.active = false;
+      if (b.hp <= 0) {
+        victory();
+      }
+    }
+  }
+}
+
+// ============================================================
+// BOSS
+// ============================================================
+function triggerBoss() {
+  S.bossTriggered = true;
+  S.phase = 'boss';
+  S.bossWarningTimer = BOSS_WARN_DUR;
+  S.paused = true;
+  S.fissures = [];
+  S.mines = [];
+  S.drones = [];
+  S.projectiles = [];
+  S.laserEnemies = [];
+}
+
+function startBossFight() {
+  const boss = S.boss;
+  boss.active = true;
+  boss.x = S.w - 100;
+  boss.y = groundY() * 0.15;
+  boss.w = 80;
+  boss.h = 100;
+  boss.hp = BOSS_HP;
+  boss.patternTimer = 0;
+  boss.sphereTimer = 2;
+  boss.bgTimer = 0;
+  boss.laserActive = false;
+  boss.laserHasHit = false;
+  boss.moveTimer = 5;
+  boss.movePhase = 'idle';
+  boss.moveAlpha = 1;
+  S.paused = false;
+}
+
+function updateBoss(dt) {
+  const boss = S.boss;
+  if (!boss.active) return;
+
+  // pattern timer
+  boss.patternTimer += dt;
+  boss.bgTimer += dt;
+
+  // movement
+  updateBossMovement(dt);
+
+  // lasers
+  if (boss.laserActive) {
+    if (boss.laserType === 0) {
+      boss.laserTimer -= dt;
+      if (boss.laserTimer <= 0) {
+        boss.laserActive = false;
+      }
+    } else {
+      // type 1: laserenemy-style phases
+      if (boss.laserPhase === 'charging') {
+        boss.laserTargetY = S.player.y + S.player.h / 2;
+        boss.laserTimer -= dt;
+        if (boss.laserTimer <= 0) {
+          boss.laserPhase = 'warning';
+          boss.laserTimer = 0.3;
+          boss.laserY = boss.laserTargetY;
+        }
+      } else if (boss.laserPhase === 'warning') {
+        boss.laserTimer -= dt;
+        if (boss.laserTimer <= 0) {
+          boss.laserPhase = 'firing';
+          boss.laserTimer = 0.3;
+          boss.laserHasHit = false;
+        }
+      } else if (boss.laserPhase === 'firing') {
+        boss.laserTimer -= dt;
+        if (boss.laserTimer <= 0) {
+          boss.laserActive = false;
+        }
+      }
+    }
+  }
+
+  // fire laser every ~3-4s, only when not moving
+  if (boss.patternTimer > 3.5 && !boss.laserActive && boss.movePhase === 'idle') {
+    boss.patternTimer = 0;
+    boss.laserActive = true;
+    boss.laserHasHit = false;
+    boss.laserType = 1;
+    boss.laserPhase = 'charging';
+    boss.laserTimer = 0.8;
+    boss.laserTargetY = S.player.y + S.player.h / 2;
+  }
+
+  // fire sphere every ~2.5s
+  boss.sphereTimer -= dt;
+  if (boss.sphereTimer <= 0) {
+    boss.sphereTimer = 3.5 + Math.random() * 1.5;
+    fireBossSphere();
+  }
+}
+
+function fireBossSphere() {
+  const boss = S.boss;
+  const targetY = S.player.y + S.player.h / 2;
+  const angle = Math.atan2(targetY - (boss.y + boss.h / 2), S.player.x - boss.x);
+  const speed = 160 + Math.random() * 40;
+  S.bossSpheres.push({
+    x: boss.x, y: boss.y + boss.h / 2 - SPHERE_SIZE / 2,
+    w: SPHERE_SIZE, h: SPHERE_SIZE,
+    vx: Math.cos(angle) * speed,
+    vy: Math.sin(angle) * speed,
+    active: true, deflected: false,
+  });
+}
+
+function updateBossMovement(dt) {
+  const boss = S.boss;
+  const gy = groundY();
+  if (boss.movePhase === 'idle') {
+    boss.moveTimer -= dt;
+    if (boss.moveTimer <= 0) {
+      boss.movePhase = 'fadingOut';
+      boss.moveFadeTimer = 0.3;
+    }
+  } else if (boss.movePhase === 'fadingOut') {
+    boss.moveFadeTimer -= dt;
+    boss.moveAlpha = Math.max(0, boss.moveFadeTimer / 0.3);
+    if (boss.moveFadeTimer <= 0) {
+      boss.moveAlpha = 0;
+      const minX = S.w / 2;
+      const maxX = S.w - boss.w - 10;
+      boss.targetX = minX + Math.random() * (maxX - minX);
+      const minY = gy * 0.1;
+      const maxY = gy - boss.h;
+      boss.targetY = minY + Math.random() * (maxY - minY);
+      boss.x = boss.targetX;
+      boss.y = boss.targetY;
+      boss.movePhase = 'fadingIn';
+      boss.moveFadeTimer = 0.3;
+    }
+  } else if (boss.movePhase === 'fadingIn') {
+    boss.moveFadeTimer -= dt;
+    boss.moveAlpha = 1 - Math.max(0, boss.moveFadeTimer / 0.3);
+    if (boss.moveFadeTimer <= 0) {
+      boss.moveAlpha = 1;
+      boss.movePhase = 'idle';
+      boss.moveTimer = 5;
+    }
+  }
+}
+
+function redirectToBoss(s) {
+  const boss = S.boss;
+  const bx = boss.x + boss.w / 2;
+  const by = boss.y + boss.h / 2;
+  const sx = s.x + s.w / 2;
+  const sy = s.y + s.h / 2;
+  const dx = bx - sx;
+  const dy = by - sy;
+  const len = Math.sqrt(dx * dx + dy * dy) || 1;
+  const speed = (Math.sqrt(s.vx * s.vx + s.vy * s.vy) || 200) * 1.8;
+  s.vx = (dx / len) * speed;
+  s.vy = (dy / len) * speed;
+}
+
+// ============================================================
+// ABILITY MODAL
+// ============================================================
+function triggerAbilityModal() {
+  S.abilityLevel++;
+  S.paused = true;
+  S.progTimer = 0;
+  const modal = S.abilityModal;
+
+  // filter pool to non-maxed abilities
+  let pool = S.abilityPool.filter(id => S.abilities[id].level < S.abilities[id].max);
+  if (pool.length === 0) {
+    // all abilities maxed — force boss immediately
+    S.paused = false;
+    S.progTimer = 0;
+    if (!S.bossTriggered) triggerBoss();
+    return;
+  }
+  // epic/legendary abilities only from progression level 3+
+  if (S.abilityLevel < 3) {
+    pool = pool.filter(id => effRarity(id) !== 'epic' && effRarity(id) !== 'legendary');
+  }
+  // rarity weights
+  pool = pool.filter(id => {
+    const r = effRarity(id);
+    if (r === 'common') return true;
+    if (r === 'rare') return Math.random() < 0.65;
+    if (r === 'epic') return Math.random() < 0.35;
+    if (r === 'legendary') return Math.random() < 0.10;
+    return true;
+  });
+  if (pool.length === 0) {
+    S.paused = false;
+    return;
+  }
+
+  // shuffle and pick 3
+  const shuffled = [...pool].sort(() => Math.random() - 0.5);
+  modal.choices = shuffled.slice(0, Math.min(3, shuffled.length));
+  modal.active = true;
+}
+
+function selectAbility(index) {
+  const modal = S.abilityModal;
+  if (!modal.active || index >= modal.choices.length) return;
+  const id = modal.choices[index];
+  const abil = S.abilities[id];
+  abil.level++;
+  applyAbilityEffect(id);
+  if (abil.level >= abil.max) {
+    S.abilityPool = S.abilityPool.filter(a => a !== id);
+  }
+  S.player.invincibleTimer = 1.0;
+  modal.active = false;
+  S.paused = false;
+}
+
+function applyAbilityEffect(id) {
+  const abil = S.abilities[id];
+  const lvl = abil.level;
+
+  switch (id) {
+    case 'voidVeil':
+      S.player.shieldHP = 1;
+      S.player.shieldCD = 0;
+      break;
+    case 'gravitationalBoots':
+      S.player.maxJumps = lvl >= 2 ? 3 : lvl >= 1 ? 2 : 1;
+      if (lvl >= 3) S.player.bootDmg = true;
+      break;
+    case 'matterEcho':
+      S.player.attProjectile = true;
+      S.player.attProjLvl = lvl;
+      if (lvl >= 3) S.player.attCone = true;
+      break;
+    case 'timeDistortion':
+      // efeitos aplicados em tempo real via ground slam
+      break;
+  }
+}
+
+// ============================================================
+// REWIND (Time Distortion L3)
+// ============================================================
+function triggerRewind() {
+  const p = S.player;
+  p.hasRewind = false;
+  p.vy = 0;
+  p.y = groundY() - p.h - REWIND_SAFE_Y_OFFSET;
+  // find safe ground
+  const gy = groundY();
+  // place player on ground, ensure no fissure underneath
+  let safe = false;
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const testX = S.w * 0.1 + Math.random() * S.w * 0.3;
+    p.x = testX;
+    let overFissure = false;
+    for (const f of S.fissures) {
+      if (f.active && p.x + p.w > f.x && p.x < f.x + f.w) {
+        overFissure = true;
+        break;
+      }
+    }
+    if (!overFissure) {
+      p.y = gy - p.h;
+      p.onGround = true;
+      p.jumpCount = 0;
+      safe = true;
+      break;
+    }
+  }
+  if (!safe) {
+    p.y = gy - p.h;
+    p.onGround = true;
+  }
+  p.vy = 0;
+  // visual feedback
+  spawnParticles(p.x + p.w/2, p.y + p.h, 15, '#ffff00', 6);
+  // reduce score a bit
+  S.survivalScore = Math.max(0, S.survivalScore - 30 * 10);
+  S.score = Math.floor(S.survivalScore + S.killScore);
+}
+
+// ============================================================
+// GAME OVER / VICTORY
+// ============================================================
+function gameOver() {
+  S.phase = 'gameover';
+  S.gameOver = true;
+  S.paused = true;
+  spawnParticles(S.player.x + S.player.w/2, S.player.y + S.player.h/2, 20, '#ff0044', 8);
+}
+
+function victory() {
+  S.phase = 'victory';
+  S.victory = true;
+  S.paused = true;
+  // big particle burst
+  for (let i = 0; i < 30; i++) {
+    spawnParticles(S.boss.x + S.boss.w/2, S.boss.y + S.boss.h/2, 30, '#ffaa00', 10);
+  }
+}
+
+// ============================================================
+// PARTICLES
+// ============================================================
+function spawnParticles(x, y, count, color, speed) {
+  for (let i = 0; i < count; i++) {
+    const angle = rand(0, Math.PI * 2);
+    const spd = rand(speed * 20, speed * 60);
+    S.particles.push({
+      x, y, vx: Math.cos(angle) * spd, vy: Math.sin(angle) * spd - 30,
+      life: PARTICLE_LIFE, maxLife: PARTICLE_LIFE, color, r: rand(2, 5),
+    });
+  }
+}
+
+function updateParticles(dt) {
+  for (const p of S.particles) {
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vy += 100 * dt;
+    p.life -= dt;
+  }
+  S.particles = S.particles.filter(p => p.life > 0);
+}
+
+// ============================================================
+// PROJECTILES
+// ============================================================
+function updateProjectiles(dt) {
+  for (const p of S.projectiles) {
+    if (!p.active) continue;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    if (p.x > S.w + 50 || p.x < -50) p.active = false;
+  }
+}
+
+// ============================================================
+// RENDER
+// ============================================================
+function render() {
+  const ctx = S.ctx;
+  const W = S.w, H = S.h;
+  const gy = groundY();
+
+  // clear
+  ctx.fillStyle = '#08081a';
+  ctx.fillRect(0, 0, W, H);
+
+  // background stars
+  drawStars();
+
+  // ground
+  drawGround(gy);
+
+  // fissures
+  for (const f of S.fissures) {
+    if (!f.active) continue;
+    drawFissure(f);
+  }
+
+  // laser enemies
+  for (const e of S.laserEnemies) { if (e.active) drawLaserEnemy(e); }
+
+  // entities
+  for (const m of S.mines) { if (m.active) drawMine(m); }
+  for (const d of S.drones) { if (d.active) drawDrone(d); }
+  for (const s of S.bossSpheres) { if (s.active) drawBossSphere(s); }
+  for (const p of S.projectiles) { if (p.active) drawProjectile(p); }
+
+  // boss
+  if (S.boss.active && S.phase === 'boss') drawBoss();
+
+  // boss laser
+  if (S.boss.active && S.boss.laserActive) drawBossLaser();
+
+  // player
+  drawPlayer();
+
+  // deflect barrier
+  if (S.player.deflectActive) drawDeflect();
+
+  // attack trail
+  if (S.player.attTrail > 0 && !S.player.attProjectile) {
+    ctx.fillStyle = 'rgba(0,240,255,0.2)';
+    const trailX = S.player.x + S.player.w;
+    ctx.fillRect(trailX, S.player.y + 2, S.player.attRange, BASE_ATTACK_H);
+  }
+
+  // attack flash
+  if (S.player.attActive && !S.player.attProjectile) {
+    drawAttack();
+  }
+
+  // player charge bar
+  if (S.player.charging) drawPlayerCharge();
+
+  // player laser
+  if (S.playerLaser.active) drawPlayerLaser();
+
+  // particles
+  drawParticles();
+
+  // cracks
+  for (const c of S.cracks) {
+    const ctx = S.ctx;
+    const alpha = c.life / c.maxLife;
+    const ex = c.x + Math.cos(c.angle) * c.length;
+    const ey = c.y + Math.sin(c.angle) * c.length;
+    ctx.save();
+    ctx.shadowColor = '#ff8866';
+    ctx.shadowBlur = 15 + (1 - alpha) * 10;
+    ctx.strokeStyle = `rgba(255,136,102,${alpha})`;
+    ctx.lineWidth = 2 + (1 - alpha) * 3;
+    ctx.beginPath();
+    ctx.moveTo(c.x, c.y);
+    ctx.lineTo(ex, ey);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // slam rifts
+  for (const r of S.slamRifts) {
+    if (!r.active) continue;
+    const ctx = S.ctx;
+    const alpha = Math.min(r.timer / 2, 1);
+    ctx.save();
+    ctx.shadowColor = '#ffaa00';
+    ctx.shadowBlur = 30;
+    ctx.strokeStyle = `rgba(255,170,0,${alpha * 0.6})`;
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 8]);
+    ctx.lineDashOffset = -S.elapsed * 50;
+    ctx.strokeRect(r.x, r.y, r.w, r.h);
+    ctx.fillStyle = `rgba(255,170,0,${alpha * 0.1})`;
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.setLineDash([]);
+    ctx.restore();
+  }
+
+  // HUD
+  if (S.started && S.phase !== 'start') drawHUD();
+
+  // boss warning
+  if (S.bossWarningTimer > 0) drawBossWarning();
+
+  // boss HP bar
+  if (S.boss.active && S.phase === 'boss' && !S.gameOver && !S.victory) drawBossHP();
+
+  // overlays
+  if (S.phase === 'start') drawStartScreen();
+  if (S.abilityModal.active) drawAbilityModal();
+  if (S.gameOver) drawGameOver();
+  if (S.victory) drawVictory();
+}
+
+// ============================================================
+// DRAWING FUNCTIONS
+// ============================================================
+function drawStars() {
+  const ctx = S.ctx;
+  for (const s of S.stars) {
+    s.x -= s.sp;
+    if (s.x < -2) s.x = S.w + 2;
+    ctx.globalAlpha = s.b;
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawGround(gy) {
+  const ctx = S.ctx;
+  // main ground fill
+  const grad = ctx.createLinearGradient(0, gy, 0, S.h);
+  grad.addColorStop(0, '#1a1a3a');
+  grad.addColorStop(1, '#0d0d1f');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, gy, S.w, S.h - gy);
+
+  // grid lines
+  ctx.strokeStyle = 'rgba(0,240,255,0.05)';
+  ctx.lineWidth = 1;
+  const gridSize = 60;
+  const offset = S.groundOffset;
+  for (let x = -offset % gridSize; x < S.w; x += gridSize) {
+    ctx.beginPath(); ctx.moveTo(x, gy); ctx.lineTo(x, S.h); ctx.stroke();
+  }
+  for (let y = gy + (gridSize - (gy % gridSize)); y < S.h; y += gridSize) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(S.w, y); ctx.stroke();
+  }
+
+  // top glow line
+  ctx.strokeStyle = 'rgba(0,240,255,0.3)';
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(S.w, gy); ctx.stroke();
+}
+
+function drawFissure(f) {
+  const ctx = S.ctx;
+  // dark gap
+  ctx.fillStyle = '#08081a';
+  ctx.fillRect(f.x, f.y - 2, f.w, f.h + 4);
+  // glow edges
+  ctx.shadowColor = '#ff00ff';
+  ctx.shadowBlur = 12;
+  ctx.strokeStyle = 'rgba(255,0,255,0.6)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(f.x, f.y);
+  ctx.lineTo(f.x, f.y + 20);
+  ctx.moveTo(f.x + f.w, f.y);
+  ctx.lineTo(f.x + f.w, f.y + 20);
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+}
+
+function drawMine(m) {
+  const ctx = S.ctx;
+  ctx.save();
+  ctx.translate(m.x + m.w/2, m.y + m.h/2);
+  // octagon
+  const r = m.w / 2;
+  ctx.shadowColor = '#ff0044';
+  ctx.shadowBlur = 15;
+  ctx.strokeStyle = '#ff0044';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (let i = 0; i < 8; i++) {
+    const ang = (i / 8) * Math.PI * 2 - Math.PI / 8;
+    const px = Math.cos(ang) * r;
+    const py = Math.sin(ang) * r;
+    i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+  ctx.stroke();
+  // inner glow
+  ctx.fillStyle = 'rgba(255,0,68,0.15)';
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.restore();
+  // pulse indicator
+  const pulse = Math.sin(S.elapsed * 4) * 0.3 + 0.7;
+  ctx.fillStyle = `rgba(255,0,68,${pulse * 0.2})`;
+  ctx.beginPath();
+  ctx.arc(m.x + m.w/2, m.y + m.h/2, r + 4, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawDrone(d) {
+  const ctx = S.ctx;
+  ctx.save();
+  // warning glow (about to shoot)
+  const warnGlow = d.shootWarning > 0;
+  ctx.shadowColor = warnGlow ? '#ff8800' : '#00ff88';
+  ctx.shadowBlur = warnGlow ? 20 : 10;
+  // body (trapezoid-ish)
+  ctx.fillStyle = warnGlow ? '#ff8800' : '#00ff88';
+  ctx.strokeStyle = warnGlow ? '#ff8800' : '#00ff88';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(d.x, d.y + d.h);
+  ctx.lineTo(d.x + d.w/3, d.y);
+  ctx.lineTo(d.x + d.w*2/3, d.y);
+  ctx.lineTo(d.x + d.w, d.y + d.h);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  // eye
+  ctx.fillStyle = '#ffffff';
+  ctx.shadowBlur = 5;
+  ctx.beginPath();
+  ctx.arc(d.x + d.w/2, d.y + d.h*0.5, 4, 0, Math.PI*2);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.restore();
+}
+
+function drawPlayer() {
+  const ctx = S.ctx;
+  const p = S.player;
+  const inv = p.invincibleTimer > 0;
+  ctx.save();
+  ctx.translate(p.x + p.w/2, p.y + p.h/2);
+  // diamond shape
+  const hw = p.w/2, hh = p.h/2;
+  const alpha = inv ? 0.3 + 0.7*(Math.sin(S.elapsed * 30) * 0.5 + 0.5) : 1;
+  ctx.globalAlpha = alpha;
+  ctx.shadowColor = inv ? '#ffd700' : '#00f0ff';
+  ctx.shadowBlur = inv ? 28 : 18;
+  ctx.strokeStyle = inv ? '#ffd700' : '#00f0ff';
+  ctx.lineWidth = 2.5;
+  ctx.fillStyle = inv ? 'rgba(255,215,0,0.15)' : 'rgba(0,240,255,0.1)';
+  ctx.beginPath();
+  ctx.moveTo(0, -hh);
+  ctx.lineTo(hw, 0);
+  ctx.lineTo(0, hh);
+  ctx.lineTo(-hw, 0);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  // inner glow
+  ctx.shadowBlur = 8;
+  ctx.fillStyle = inv ? 'rgba(255,215,0,0.35)' : 'rgba(0,240,255,0.3)';
+  ctx.beginPath();
+  ctx.moveTo(0, -hh*0.5);
+  ctx.lineTo(hw*0.4, 0);
+  ctx.lineTo(0, hh*0.5);
+  ctx.lineTo(-hw*0.4, 0);
+  ctx.closePath();
+  ctx.fill();
+  // void veil shield ring
+  if (p.shieldHP > 0) {
+    const shieldR = Math.max(hw, hh) + 8;
+    const shieldPulse = 1 + Math.sin(S.elapsed * 4) * 0.04;
+    ctx.shadowColor = '#00ffff';
+    ctx.shadowBlur = 20;
+    ctx.strokeStyle = 'rgba(0,255,255,0.5)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 6]);
+    ctx.lineDashOffset = -S.elapsed * 40;
+    ctx.beginPath();
+    ctx.arc(0, 0, shieldR * shieldPulse, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  ctx.shadowBlur = 0;
+  ctx.restore();
+}
+
+function drawAttack() {
+  const ctx = S.ctx;
+  const p = S.player;
+  const ax = p.x + p.w;
+  const ay = p.y + 2;
+  const aw = p.attRange;
+  const ah = BASE_ATTACK_H;
+
+  ctx.save();
+  ctx.shadowColor = '#ffffff';
+  ctx.shadowBlur = 20;
+  const grad = ctx.createLinearGradient(ax, ay, ax + aw, ay);
+  grad.addColorStop(0, 'rgba(255,255,255,0.9)');
+  grad.addColorStop(0.5, 'rgba(0,240,255,0.6)');
+  grad.addColorStop(1, 'rgba(0,240,255,0)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(ax, ay, aw, ah);
+  ctx.shadowBlur = 0;
+  ctx.restore();
+}
+
+function drawDeflect() {
+  const ctx = S.ctx;
+  const p = S.player;
+  const a = DEFLECT_AURA;
+  const cx = p.x + p.w/2, cy = p.y + p.h/2;
+  const r = Math.max(p.w, p.h)/2 + a;
+  ctx.save();
+  const readyAlpha = p.deflectReady ? 0.5 : 0.2;
+  const pulse = 1 + Math.sin(S.elapsed * 20) * 0.08;
+  ctx.shadowColor = '#aa00ff';
+  ctx.shadowBlur = 30;
+  ctx.strokeStyle = '#aa00ff';
+  ctx.lineWidth = 2;
+  ctx.setLineDash([6, 6]);
+  ctx.lineDashOffset = -S.elapsed * 60;
+  // hexagon aura around player
+  ctx.beginPath();
+  for (let i = 0; i < 6; i++) {
+    const ang = (i/6)*Math.PI*2 - Math.PI/6;
+    const px = cx + Math.cos(ang)*r*pulse;
+    const py = cy + Math.sin(ang)*r*pulse;
+    i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+  ctx.fillStyle = `rgba(170,0,255,${readyAlpha*0.5})`;
+  ctx.fill();
+  ctx.stroke();
+  // inner glow ring when ready
+  if (p.deflectReady) {
+    ctx.shadowBlur = 20;
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.arc(cx, cy, r*0.6, 0, Math.PI*2);
+    ctx.stroke();
+  }
+  ctx.shadowBlur = 0;
+  ctx.setLineDash([]);
+  ctx.restore();
+}
+
+function drawPlayerCharge() {
+  const ctx = S.ctx;
+  const p = S.player;
+  const echoLvl = S.abilities.matterEcho.level;
+  const barW = 50, barH = 6;
+  const bx = p.x + p.w/2 - barW/2, by = p.y - 16;
+  ctx.save();
+  ctx.shadowBlur = 0;
+  // background
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(bx, by, barW, barH);
+  // L2 bar (blue)
+  const progL2 = Math.min(p.chargeTimer / MATTER_CHARGE_L2, 1);
+  ctx.fillStyle = progL2 >= 1 ? '#00ffff' : '#0088ff';
+  ctx.shadowColor = '#0088ff';
+  ctx.shadowBlur = progL2 >= 1 ? 10 : 4;
+  ctx.fillRect(bx, by, barW * progL2, barH);
+  // L3 supercharge bar (red) — only after L2 bar is full
+  if (echoLvl >= 3 && progL2 >= 1) {
+    const progL3 = (p.chargeTimer - MATTER_CHARGE_L2) / (MATTER_CHARGE_L3 - MATTER_CHARGE_L2);
+    ctx.shadowColor = '#ff4400';
+    ctx.shadowBlur = progL3 >= 1 ? 12 : 5;
+    ctx.fillStyle = progL3 >= 1 ? '#ff8800' : '#ff4400';
+    ctx.fillRect(bx, by, barW, barH);
+  }
+  ctx.shadowBlur = 0;
+  ctx.restore();
+}
+
+function drawPlayerLaser() {
+  const ctx = S.ctx;
+  const ls = S.playerLaser;
+  const alpha = Math.min(ls.life / 0.15, 1);
+  ctx.save();
+  ctx.shadowColor = '#0088ff';
+  ctx.shadowBlur = 30 * alpha;
+  ctx.fillStyle = `rgba(0,136,255,${0.3 * alpha})`;
+  ctx.fillRect(0, ls.y - 2, S.w, 12);
+  ctx.fillStyle = `rgba(100,200,255,${0.7 * alpha})`;
+  ctx.fillRect(0, ls.y, S.w, 8);
+  ctx.shadowBlur = 0;
+  ctx.restore();
+}
+
+function drawLaserEnemy(e) {
+  const ctx = S.ctx;
+  ctx.save();
+  // base square
+  ctx.shadowColor = e.phase === 'firing' ? '#ff0000' : e.phase === 'warning' ? '#ff4400' : e.phase === 'charging' ? '#880000' : '#1a1a2a';
+  ctx.shadowBlur = e.phase === 'charging' ? 15 + Math.sin(S.elapsed * 12) * 10 : 8;
+  ctx.fillStyle = e.phase === 'firing' ? '#440000' : e.phase === 'warning' ? '#220000' : '#0d0d1a';
+  ctx.strokeStyle = e.phase === 'firing' ? '#ff0000' : e.phase === 'warning' ? '#ff4400' : e.phase === 'charging' ? '#cc0000' : '#333355';
+  ctx.lineWidth = 2;
+  ctx.fillRect(e.x, e.y, e.w, e.h);
+  ctx.strokeRect(e.x, e.y, e.w, e.h);
+  // warning line
+  if (e.phase === 'warning') {
+    ctx.shadowColor = '#ff4400';
+    ctx.shadowBlur = 12;
+    ctx.fillStyle = 'rgba(255,68,0,0.4)';
+    ctx.fillRect(0, e.laserY - 1, S.w, 3);
+  }
+  // firing beam
+  if (e.phase === 'firing') {
+    ctx.shadowColor = '#ff0000';
+    ctx.shadowBlur = 20;
+    ctx.fillStyle = 'rgba(255,0,0,0.7)';
+    ctx.fillRect(0, e.laserY, S.w, 8);
+    ctx.fillStyle = 'rgba(255,200,200,0.9)';
+    ctx.fillRect(0, e.laserY + 2, S.w, 4);
+  }
+  ctx.shadowBlur = 0;
+  ctx.restore();
+}
+
+function drawBossSphere(s) {
+  const ctx = S.ctx;
+  ctx.save();
+  const cx = s.x + s.w/2, cy = s.y + s.h/2;
+  const r = s.w/2;
+  const color = s.deflected ? '#ffaa00' : '#ff4400';
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 20;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.fillStyle = s.deflected ? 'rgba(255,170,0,0.2)' : 'rgba(255,68,0,0.2)';
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  // inner
+  ctx.shadowBlur = 8;
+  ctx.fillStyle = s.deflected ? 'rgba(255,170,0,0.4)' : 'rgba(255,68,0,0.4)';
+  ctx.beginPath();
+  ctx.arc(cx, cy, r * 0.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.restore();
+}
+
+function drawProjectile(p) {
+  const ctx = S.ctx;
+  ctx.save();
+  const cx = p.x + p.w/2, cy = p.y + p.h/2;
+  const r = p.w/2;
+  ctx.shadowColor = '#00ffff';
+  ctx.shadowBlur = 15;
+  ctx.fillStyle = '#00ffff';
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.restore();
+}
+
+function drawBoss() {
+  const ctx = S.ctx;
+  const boss = S.boss;
+  ctx.save();
+  ctx.globalAlpha = boss.moveAlpha;
+  ctx.translate(boss.x + boss.w/2, boss.y + boss.h/2);
+
+  // rotating geometric shape
+  const angle = S.elapsed * 0.5;
+  ctx.rotate(angle);
+
+  const r1 = boss.w/2, r2 = boss.h/2;
+  ctx.shadowColor = '#ff4400';
+  ctx.shadowBlur = 25;
+  ctx.strokeStyle = '#ff4400';
+  ctx.lineWidth = 3;
+  ctx.fillStyle = 'rgba(255,68,0,0.1)';
+
+  // hexagon
+  ctx.beginPath();
+  for (let i = 0; i < 6; i++) {
+    const a = (i / 6) * Math.PI * 2 - Math.PI / 6;
+    const px = Math.cos(a) * r1;
+    const py = Math.sin(a) * r2;
+    i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  // inner shape (rotates opposite)
+  ctx.rotate(-angle * 2);
+  ctx.shadowColor = '#aa00ff';
+  ctx.shadowBlur = 15;
+  ctx.strokeStyle = '#aa00ff';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (let i = 0; i < 4; i++) {
+    const a = (i / 4) * Math.PI * 2 + S.elapsed * 0.3;
+    const px = Math.cos(a) * r1 * 0.5;
+    const py = Math.sin(a) * r2 * 0.5;
+    i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+  ctx.stroke();
+
+  // core
+  ctx.shadowColor = '#ff4400';
+  ctx.shadowBlur = 10;
+  ctx.fillStyle = 'rgba(255,68,0,0.5)';
+  ctx.beginPath();
+  ctx.arc(0, 0, 8, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.shadowBlur = 0;
+  ctx.restore();
+}
+
+function drawBossLaser() {
+  const ctx = S.ctx;
+  const boss = S.boss;
+  ctx.save();
+  if (boss.laserType === 0) {
+    // type 0: current warning + beam (single-hit)
+    const warn = Math.min(1, boss.laserTimer / 0.4);
+    ctx.shadowColor = '#ff0000';
+    ctx.shadowBlur = 30 * warn;
+    ctx.fillStyle = `rgba(255,0,0,${0.3 * warn})`;
+    ctx.fillRect(0, boss.laserY - 2, S.w, 12);
+    ctx.fillStyle = `rgba(255,200,200,${0.7 * warn})`;
+    ctx.fillRect(0, boss.laserY, S.w, 8);
+  } else {
+    // type 1: laserenemy-style phases
+    if (boss.laserPhase === 'charging') {
+      const pulse = Math.sin(S.elapsed * 12) * 0.3 + 0.7;
+      ctx.shadowColor = '#880000';
+      ctx.shadowBlur = 20 * pulse;
+      ctx.strokeStyle = '#cc0000';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(boss.x - 4, boss.y - 4, boss.w + 8, boss.h + 8);
+    } else if (boss.laserPhase === 'warning') {
+      ctx.shadowColor = '#ff4400';
+      ctx.shadowBlur = 12;
+      ctx.fillStyle = 'rgba(255,68,0,0.4)';
+      ctx.fillRect(0, boss.laserY - 1, S.w, 3);
+    } else if (boss.laserPhase === 'firing') {
+      ctx.shadowColor = '#ff0000';
+      ctx.shadowBlur = 20;
+      ctx.fillStyle = 'rgba(255,0,0,0.7)';
+      ctx.fillRect(0, boss.laserY, S.w, 8);
+      ctx.fillStyle = 'rgba(255,200,200,0.9)';
+      ctx.fillRect(0, boss.laserY + 2, S.w, 4);
+    }
+  }
+  ctx.shadowBlur = 0;
+  ctx.restore();
+}
+
+function drawBossHP() {
+  const ctx = S.ctx;
+  const boss = S.boss;
+  const barW = 200;
+  const barH = 14;
+  const bx = S.w/2 - barW/2;
+  const by = 30;
+
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(bx - 2, by - 2, barW + 4, barH + 4);
+
+  ctx.fillStyle = '#ff4400';
+  ctx.fillRect(bx, by, barW * (boss.hp / BOSS_HP), barH);
+
+  ctx.strokeStyle = '#ff4400';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(bx, by, barW, barH);
+
+  ctx.fillStyle = '#ffffff';
+  ctx.font = '10px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText(`ARQUITETO DO VAZIO  ${boss.hp}/${BOSS_HP}`, S.w/2, by - 6);
+}
+
+function drawBossWarning() {
+  const ctx = S.ctx;
+  ctx.save();
+  ctx.fillStyle = 'rgba(255,0,0,0.15)';
+  ctx.fillRect(0, 0, S.w, S.h);
+
+  const pulse = Math.sin(S.elapsed * 8) * 0.3 + 0.7;
+  ctx.globalAlpha = pulse;
+  ctx.strokeStyle = '#ff0000';
+  ctx.lineWidth = 3;
+  ctx.shadowColor = '#ff0000';
+  ctx.shadowBlur = 30;
+  ctx.strokeRect(20, 20, S.w - 40, S.h - 40);
+
+  ctx.fillStyle = '#ff0000';
+  ctx.font = 'bold 36px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('⚠ ANOMALIA PRIMÁRIA DETECTADA ⚠', S.w/2, S.h/2);
+
+  ctx.font = '18px monospace';
+  ctx.fillText('ARQUITETO DO VAZIO', S.w/2, S.h/2 + 50);
+  ctx.shadowBlur = 0;
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
+function drawHUD() {
+  const ctx = S.ctx;
+  ctx.save();
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+
+  // progression bar (top-left, above PONTOS)
+  if (!S.paused) {
+    const barW = Math.min(S.w * 0.35, 200);
+    const barH = 10, barX = 16, barY = 16;
+    const fill = S.progTimer / PROGRESSION_INTERVAL;
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.strokeStyle = '#00f0ff';
+    ctx.lineWidth = 1;
+    ctx.fillRect(barX, barY, barW, barH);
+    ctx.strokeRect(barX, barY, barW, barH);
+    ctx.fillStyle = '#00f0ff';
+    ctx.shadowColor = '#00f0ff';
+    ctx.shadowBlur = 6;
+    ctx.fillRect(barX, barY, barW * fill, barH);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.font = '9px monospace';
+    ctx.fillText(`PROGRESSÃO  ${Math.floor(S.progTimer)}/${PROGRESSION_INTERVAL}s`, barX, barY + barH + 2);
+  }
+
+  // score
+  ctx.fillStyle = '#ffffff';
+  ctx.font = '16px monospace';
+  const scoreY = S.paused ? 16 : 44;
+  ctx.fillText(`PONTOS: ${S.score}`, 16, scoreY);
+
+  // elapsed time
+  const mins = Math.floor(S.elapsed / 60);
+  const secs = Math.floor(S.elapsed % 60);
+  ctx.fillText(`TEMPO: ${mins}:${secs.toString().padStart(2, '0')}`, 16, scoreY + 24);
+
+  // abilities display
+  let abY = scoreY + 48;
+  ctx.font = '12px monospace';
+  for (const [id, abil] of Object.entries(S.abilities)) {
+    if (abil.level > 0) {
+      const r = effRarity(id);
+      ctx.fillStyle = r === 'legendary' ? '#ffaa00' : r === 'epic' ? '#aa00ff' : r === 'rare' ? '#00ffff' : '#00ff88';
+      ctx.fillText(`${abil.name} Lv.${abil.level}`, 16, abY);
+      abY += 18;
+    }
+  }
+
+  ctx.restore();
+}
+
+function drawParticles() {
+  const ctx = S.ctx;
+  for (const p of S.particles) {
+    const alpha = p.life / p.maxLife;
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = p.color;
+    ctx.shadowColor = p.color;
+    ctx.shadowBlur = 8;
+    ctx.fillRect(p.x - p.r/2, p.y - p.r/2, p.r, p.r);
+  }
+  ctx.globalAlpha = 1;
+  ctx.shadowBlur = 0;
+}
+
+// ============================================================
+// START SCREEN
+// ============================================================
+function drawStartScreen() {
+  const ctx = S.ctx;
+  ctx.save();
+  // dark overlay
+  ctx.fillStyle = 'rgba(8,8,26,0.7)';
+  ctx.fillRect(0, 0, S.w, S.h);
+
+  // title
+  ctx.shadowColor = '#00f0ff';
+  ctx.shadowBlur = 40;
+  ctx.fillStyle = '#00f0ff';
+  ctx.font = 'bold 52px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('VOID DASH', S.w/2, S.h * 0.3);
+
+  ctx.shadowColor = '#aa00ff';
+  ctx.shadowBlur = 20;
+  ctx.fillStyle = '#aa00ff';
+  ctx.font = 'bold 24px monospace';
+  ctx.fillText('ANOMALIA', S.w/2, S.h * 0.3 + 48);
+
+  // controls
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = 'rgba(255,255,255,0.7)';
+  ctx.font = '13px monospace';
+  ctx.fillText('PULO: ESPAÇO / W / ↑  |  ATAQUE: Z / J  |  REBATER: X', S.w/2, S.h * 0.55);
+  ctx.fillText('MOBILE: ESQUERDO = PULO  |  CENTRO = ATAQUE  |  DIREITO = REBATER', S.w/2, S.h * 0.55 + 22);
+
+  // pulsing start text
+  const pulse = Math.sin(S.elapsed * 3) * 0.3 + 0.7;
+  ctx.globalAlpha = pulse;
+  ctx.fillStyle = '#ffffff';
+  ctx.font = '18px monospace';
+  ctx.fillText('PRESSIONE ESPAÇO OU TOQUE PARA INICIAR', S.w/2, S.h * 0.72);
+  ctx.globalAlpha = 1;
+
+  ctx.restore();
+}
+
+// ============================================================
+// GAME OVER SCREEN
+// ============================================================
+function drawGameOver() {
+  const ctx = S.ctx;
+  ctx.save();
+  ctx.fillStyle = 'rgba(8,8,26,0.8)';
+  ctx.fillRect(0, 0, S.w, S.h);
+
+  ctx.shadowColor = '#ff0044';
+  ctx.shadowBlur = 40;
+  ctx.fillStyle = '#ff0044';
+  ctx.font = 'bold 48px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('GAME OVER', S.w/2, S.h * 0.35);
+
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = '#ffffff';
+  ctx.font = '22px monospace';
+  ctx.fillText(`PONTUAÇÃO FINAL: ${S.score}`, S.w/2, S.h * 0.5);
+
+  ctx.fillStyle = 'rgba(255,255,255,0.6)';
+  ctx.font = '14px monospace';
+  ctx.fillText(`TEMPO: ${Math.floor(S.elapsed)}s | INIMIGOS: ${Math.floor(S.killScore / 50)}`, S.w/2, S.h * 0.56);
+
+  const pulse = Math.sin(S.elapsed * 3) * 0.3 + 0.7;
+  ctx.globalAlpha = pulse;
+  ctx.fillStyle = '#ffffff';
+  ctx.font = '16px monospace';
+  ctx.fillText('PRESSIONE ESPAÇO OU TOQUE PARA REINICIAR', S.w/2, S.h * 0.7);
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
+// ============================================================
+// VICTORY SCREEN
+// ============================================================
+function drawVictory() {
+  const ctx = S.ctx;
+  ctx.save();
+  ctx.fillStyle = 'rgba(8,8,26,0.8)';
+  ctx.fillRect(0, 0, S.w, S.h);
+
+  ctx.shadowColor = '#ffaa00';
+  ctx.shadowBlur = 50;
+  ctx.fillStyle = '#ffaa00';
+  ctx.font = 'bold 48px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('VITÓRIA!', S.w/2, S.h * 0.3);
+
+  ctx.shadowColor = '#00ff88';
+  ctx.shadowBlur = 20;
+  ctx.fillStyle = '#00ff88';
+  ctx.font = 'bold 24px monospace';
+  ctx.fillText('ARQUITETO DO VAZIO DERROTADO', S.w/2, S.h * 0.3 + 50);
+
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = '#ffffff';
+  ctx.font = '22px monospace';
+  ctx.fillText(`PONTUAÇÃO FINAL: ${S.score}`, S.w/2, S.h * 0.5);
+
+  const pulse = Math.sin(S.elapsed * 3) * 0.3 + 0.7;
+  ctx.globalAlpha = pulse;
+  ctx.fillStyle = '#ffffff';
+  ctx.font = '16px monospace';
+  ctx.fillText('PRESSIONE ESPAÇO OU TOQUE PARA REINICIAR', S.w/2, S.h * 0.7);
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
+// ============================================================
+// ABILITY MODAL
+// ============================================================
+function hitTestModal(cx, cy) {
+  const W = S.w, H = S.h;
+  const cols = S.abilityModal.choices.length;
+  const cardW = 200, cardH = 200;
+  const gap = 16;
+  const totalW = cols * cardW + (cols - 1) * gap;
+  const startX = W/2 - totalW/2;
+  const cardY = H/2 - cardH/2;
+  for (let i = 0; i < cols; i++) {
+    const cx2 = startX + i * (cardW + gap);
+    if (cx >= cx2 && cx <= cx2 + cardW && cy >= cardY && cy <= cardY + cardH) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function drawAbilityModal() {
+  const ctx = S.ctx;
+  const W = S.w, H = S.h;
+  const choices = S.abilityModal.choices;
+  if (!choices.length) return;
+
+  ctx.save();
+  // dark overlay
+  ctx.fillStyle = 'rgba(8,8,26,0.85)';
+  ctx.fillRect(0, 0, W, H);
+
+  // title
+  ctx.shadowColor = '#00f0ff';
+  ctx.shadowBlur = 20;
+  ctx.fillStyle = '#00f0ff';
+  ctx.font = 'bold 24px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('ESCOLHA UMA HABILIDADE', W/2, H * 0.2);
+  ctx.shadowBlur = 0;
+
+  const cols = choices.length;
+  const cardW = 200, cardH = 200;
+  const gap = 16;
+  const totalW = cols * cardW + (cols - 1) * gap;
+  const startX = W/2 - totalW/2;
+  const cardY = H/2 - cardH/2;
+
+  ctx.font = '13px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  for (let i = 0; i < cols; i++) {
+    const id = choices[i];
+    const abil = S.abilities[id];
+    const cx = startX + i * (cardW + gap);
+    const cy = cardY;
+    const have = abil.level > 0;
+    const nextLvl = have ? abil.level + 1 : 1;
+
+    // card bg
+    const r = effRarity(id);
+    const borderColor = r === 'legendary' ? '#ffaa00' : r === 'epic' ? '#aa00ff' : r === 'rare' ? '#00ffff' : '#00ff88';
+    ctx.fillStyle = 'rgba(10,10,30,0.9)';
+    ctx.shadowColor = borderColor;
+    ctx.shadowBlur = 15;
+    ctx.strokeStyle = borderColor;
+    ctx.lineWidth = 2;
+    ctx.fillRect(cx, cy, cardW, cardH);
+    ctx.strokeRect(cx, cy, cardW, cardH);
+    ctx.shadowBlur = 0;
+
+    // rarity label
+    ctx.fillStyle = borderColor;
+    ctx.font = '10px monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    const rarityLabel = r === 'legendary' ? 'LENDÁRIA' : r === 'epic' ? 'ÉPICA' : r === 'rare' ? 'RARA' : 'COMUM';
+    ctx.fillText(rarityLabel, cx + 10, cy + 8);
+
+    // name
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 15px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(abil.name, cx + cardW/2, cy + 36);
+
+    // level info
+    ctx.font = '13px monospace';
+    ctx.fillStyle = have ? '#00ff88' : 'rgba(255,255,255,0.5)';
+    const lvlText = have ? `Nível ${abil.level} → ${nextLvl}` : 'NOVA';
+    ctx.fillText(lvlText, cx + cardW/2, cy + 60);
+
+    // description (wrapped)
+    ctx.font = '11px monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.8)';
+    const descs = ABIL_DESC[id];
+    const descIdx = Math.min(nextLvl - 1, descs.length - 1);
+    const desc = descs[descIdx];
+    ctx.textBaseline = 'top';
+    // wrap at ~28 chars
+    const words = desc.split(' ');
+    let lines = [''];
+    for (const w of words) {
+      if ((lines[lines.length-1] + ' ' + w).length > 28) lines.push(w);
+      else lines[lines.length-1] += (lines[lines.length-1] ? ' ' : '') + w;
+    }
+    let ty = cy + 85;
+    for (const line of lines) {
+      ctx.fillText(line, cx + cardW/2, ty);
+      ty += 16;
+    }
+  }
+
+  // hint
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.font = '12px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'bottom';
+  ctx.fillText('TOQUE EM UMA HABILIDADE PARA ESCOLHER', W/2, H - 30);
+
+  ctx.restore();
+}
+
+// ============================================================
+// GAME LOOP
+// ============================================================
+function loop(timestamp) {
+  const frameTime = Math.min(timestamp - S.lastTime, 50);
+  S.lastTime = timestamp;
+
+  if (S.started && !S.gameOver && !S.victory) {
+    // boss warning counts even while paused
+    if (S.bossWarningTimer > 0) {
+      S.bossWarningTimer -= frameTime / 1000;
+      if (S.bossWarningTimer <= 0) startBossFight();
+    }
+    if (!S.paused) {
+      S.accumulator += frameTime;
+      while (S.accumulator >= FIXED_DT) {
+        update(FIXED_DT / 1000);
+        S.accumulator -= FIXED_DT;
+      }
+    }
+  }
+
+  render();
+  requestAnimationFrame(loop);
+}
+
+// ============================================================
+// BOOT
+// ============================================================
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
