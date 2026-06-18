@@ -6,6 +6,9 @@
 
 **Void Dash** é um *endless-runner / rogue-lite* de ação com temática neon e física baseada em gravidade. Desenvolvido em HTML5 Canvas puro (Vanilla JS), o jogo roda inteiramente em um único arquivo — sem dependências, sem assets externos, sem build step.
 
+**Colaboradores:** João Victor de Almeida Santos, Albert Vinicius Pinto Carvalho,
+Carlos Henrique Pinto Oliveira
+
 ---
 
 ## Contexto do Projeto
